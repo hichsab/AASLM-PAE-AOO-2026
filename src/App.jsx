@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import * as XLSX from "xlsx";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const SUPABASE_URL = "https://rehtpauuevfrahtjmdns.supabase.co";
+const SUPABASE_KEY = "sb_publishable_YE-oNBPFBnlphrf-z6ZsAQ_x1OCFV_8";
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from "recharts";
@@ -295,24 +300,67 @@ function Synthese({ data }) {
 
 /* ───────────────────────── App ───────────────────────── */
 export default function App() {
-  const [data, setData] = useState(SEED);
+  const [data, setData] = useState({ etudes: [], travaux: [] });
   const [tab, setTab] = useState("synthese");
   const [editing, setEditing] = useState(null);
   const [confirmDel, setConfirmDel] = useState(null);
   const [q, setQ] = useState("");
   const [fStatut, setFStatut] = useState("");
   const [toast, setToast] = useState("");
+  const [syncing, setSyncing] = useState(false);
   const fileRef = useRef(null);
 
+  // Charger depuis Supabase au démarrage
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORE_KEY);
-      if (saved) setData(JSON.parse(saved));
-    } catch(e) {}
+    (async () => {
+      setSyncing(true);
+      try {
+        const { data: rows, error } = await supabase.from("aoo").select("*");
+        if (error) throw error;
+        if (rows && rows.length > 0) {
+          const etudes = rows.filter(r => r.categorie === "etudes").map(r => r.data);
+          const travaux = rows.filter(r => r.categorie === "travaux").map(r => r.data);
+          if (etudes.length + travaux.length > 0) {
+            setData({ etudes, travaux });
+          } else {
+            await seedSupabase();
+          }
+        } else {
+          await seedSupabase();
+        }
+      } catch(e) {
+        flash("Erreur connexion Supabase — données locales utilisées");
+        setData(SEED);
+      }
+      setSyncing(false);
+    })();
+
+    // Écoute temps réel
+    const channel = supabase.channel("aoo-changes")
+      .on("postgres_changes", { event: "*", schema: "public", table: "aoo" }, () => {
+        reloadFromSupabase();
+      }).subscribe();
+    return () => supabase.removeChannel(channel);
   }, []);
-  useEffect(() => {
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch(e) {}
-  }, [data]);
+
+  const seedSupabase = async () => {
+    const rows = [
+      ...SEED.etudes.map(r => ({ id: r.id, categorie: "etudes", data: r })),
+      ...SEED.travaux.map(r => ({ id: r.id, categorie: "travaux", data: r })),
+    ];
+    await supabase.from("aoo").upsert(rows);
+    setData(SEED);
+  };
+
+  const reloadFromSupabase = async () => {
+    const { data: rows } = await supabase.from("aoo").select("*");
+    if (rows) {
+      setData({
+        etudes: rows.filter(r => r.categorie === "etudes").map(r => r.data),
+        travaux: rows.filter(r => r.categorie === "travaux").map(r => r.data),
+      });
+    }
+  };
 
   const flash = (m) => { setToast(m); setTimeout(()=>setToast(""),2600); };
   const cat = tab==="etudes"?"etudes":tab==="travaux"?"travaux":null;
@@ -326,24 +374,27 @@ export default function App() {
     });
   },[data,cat,q,fStatut]);
 
-  const save = (row)=>{
-    const {_isNew,_cat,...clean}=row;
-    setData(d=>{
-      const list=d[_cat];
-      const exists=list.some(x=>x.id===clean.id);
-      return {...d,[_cat]:exists?list.map(x=>x.id===clean.id?clean:x):[...list,clean]};
-    });
+  const save = async (row) => {
+    const {_isNew, _cat, ...clean} = row;
+    try {
+      await supabase.from("aoo").upsert({ id: clean.id, categorie: _cat, data: clean });
+      await reloadFromSupabase();
+      flash(_isNew ? "Appel d'offres ajouté" : "Modifications enregistrées");
+    } catch(e) { flash("Erreur lors de la sauvegarde"); }
     setEditing(null);
-    flash(_isNew?"Appel d'offres ajouté":"Modifications enregistrées");
   };
-  const del = (row)=>{
-    setData(d=>({...d,[cat]:d[cat].filter(x=>x.id!==row.id)}));
+  const del = async (row) => {
+    try {
+      await supabase.from("aoo").delete().eq("id", row.id);
+      await reloadFromSupabase();
+      flash("Appel d'offres supprimé");
+    } catch(e) { flash("Erreur lors de la suppression"); }
     setConfirmDel(null);
-    flash("Appel d'offres supprimé");
   };
   const addNew = ()=>setEditing({...mk({statut:"Programmé"}),"_isNew":true,"_cat":cat});
 
   const onImport = async(e)=>{
+    setSyncing(true);
     const file=e.target.files?.[0]; if(!file) return;
     try {
       const buf=await file.arrayBuffer();
@@ -368,11 +419,16 @@ export default function App() {
           }));
         }
       });
-      if(parsed.etudes.length+parsed.travaux.length===0){flash("Aucune donnée reconnue");return;}
-      setData(parsed);
+      if(parsed.etudes.length+parsed.travaux.length===0){flash("Aucune donnée reconnue");setSyncing(false);return;}
+      const rows = [
+        ...parsed.etudes.map(r=>({id:r.id,categorie:"etudes",data:r})),
+        ...parsed.travaux.map(r=>({id:r.id,categorie:"travaux",data:r})),
+      ];
+      await supabase.from("aoo").upsert(rows);
+      await reloadFromSupabase();
       flash(`Importé : ${parsed.travaux.length} travaux, ${parsed.etudes.length} études`);
     } catch(err){ flash("Erreur de lecture du fichier"); }
-    finally { if(fileRef.current) fileRef.current.value=""; }
+    finally { if(fileRef.current) fileRef.current.value=""; setSyncing(false); }
   };
   const parseNum=(v)=>{if(v===""||v===null||v===undefined) return null; const n=Number(String(v).replace(/[\s ]/g,"").replace(/,/g,".")); return isNaN(n)?null:n;};
 
